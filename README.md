@@ -1,17 +1,25 @@
 # husi-daxuexi
 
-自动将 `xchacha20-poly1305/husi` 最新 APK 重打包为：
+自动将 `xchacha20-poly1305/husi` **源码**拉取后直接编译为 APK（不走 husi APK 解包/smali）：
 
 - 包名：`cn.xuexi.android`
+- 包名相关引用：会同步替换 Gradle、Manifest、Java/Kotlin、资源/XML 等文本内旧包名及类路径，并迁移源码包目录，尽量避免与原 husi 冲突
 - 应用名：`学习强国`
 - 应用图标：替换为 Vivo 应用商店「学习强国」最新版 APK 图标
 - `versionCode`：按 `husi 原始 versionCode + 10000` 生成（且至少 `10001`）
 
 ## 运行方式
 
-使用 GitHub Actions `Build Repacked Husi` 手动触发。
+使用 GitHub Actions `Build Husi From Source` 手动触发。
 
-构建成功后会自动发布到 GitHub Releases，并上传 APK 产物。
+构建成功后会自动用 GitHub Secrets 里的签名变量进行签名，并发布到 GitHub Releases。
+
+需要配置的 Secrets：
+
+- `SIGNING_KEYSTORE_BASE64`
+- `SIGNING_KEY_ALIAS`
+- `SIGNING_KEYSTORE_PASSWORD`
+- `SIGNING_KEY_PASSWORD`
 
 ## 本地调试
 
