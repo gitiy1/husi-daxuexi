@@ -12,14 +12,7 @@
 
 使用 GitHub Actions `Build Husi From Source` 手动触发。
 
-构建成功后会自动用 GitHub Secrets 里的签名变量进行签名，并发布到 GitHub Releases。
-
-需要配置的 Secrets：
-
-- `SIGNING_KEYSTORE_BASE64`
-- `SIGNING_KEY_ALIAS`
-- `SIGNING_KEYSTORE_PASSWORD`
-- `SIGNING_KEY_PASSWORD`
+构建成功后会自动使用 `uber-apk-signer` 进行一键签名，并发布到 GitHub Releases。
 
 ## 本地调试
 

@@ -30,26 +30,37 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Set up Android SDK cmdline tools
+        run: |
+          sudo mkdir -p /opt/android-sdk/cmdline-tools
+          sudo curl -L -o /tmp/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          sudo unzip -q /tmp/cmdline-tools.zip -d /opt/android-sdk/cmdline-tools
+          sudo mkdir -p /opt/android-sdk/cmdline-tools/latest
+          sudo mv /opt/android-sdk/cmdline-tools/cmdline-tools/* /opt/android-sdk/cmdline-tools/latest/
+          sudo chmod +x /opt/android-sdk/cmdline-tools/latest/bin/*
+
+      - name: Install Android SDK packages
+        env:
+          ANDROID_HOME: /opt/android-sdk
+          ANDROID_SDK_ROOT: /opt/android-sdk
+        run: |
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-37.0" "build-tools;37.0.0" "ndk;29.0.14206865" "platform-tools"
+
       - name: Install apktool
         run: |
           sudo apt-get update
           sudo apt-get install -y apktool
 
-      - name: Build unsigned APK from source
+      - name: Build & sign APK from source (uber-apk-signer)
         env:
           VIVO_APP_ID: ${{ github.event.inputs.vivo_app_id }}
+          ANDROID_HOME: /opt/android-sdk
+          ANDROID_SDK_ROOT: /opt/android-sdk
+          ANDROID_NDK_HOME: /opt/android-sdk/ndk/29.0.14206865
         run: |
           python3 scripts/repack_husi.py --vivo-app-id "${VIVO_APP_ID:-2407867}" --min-version-code 10001 --version-offset 10000
-
-      - name: Sign APK with GitHub secrets
-        id: sign_app
-        uses: r0adkll/sign-android-release@v1
-        with:
-          releaseDirectory: dist
-          signingKeyBase64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
-          alias: ${{ secrets.SIGNING_KEY_ALIAS }}
-          keyStorePassword: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
-          keyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
 
       - name: Compute release tag
         id: vars
@@ -63,5 +74,4 @@ jobs:
           tag_name: ${{ steps.vars.outputs.tag }}
           name: Source-built husi ${{ steps.vars.outputs.tag }}
           generate_release_notes: true
-          files: |
-            ${{ steps.sign_app.outputs.signedReleaseFile }}
+          files: dist/*.apk
