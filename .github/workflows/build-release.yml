@@ -30,6 +30,11 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
+
       - name: Set up Android SDK cmdline tools
         run: |
           sudo mkdir -p /opt/android-sdk/cmdline-tools
@@ -46,7 +51,7 @@ jobs:
         run: |
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
           yes | sdkmanager --licenses
-          sdkmanager "platforms;android-37.0" "build-tools;37.0.0" "ndk;29.0.14206865" "platform-tools"
+          sdkmanager "platforms;android-23" "platforms;android-37.0" "build-tools;37.0.0" "ndk;29.0.14206865" "platform-tools"
 
       - name: Install apktool
         run: |
