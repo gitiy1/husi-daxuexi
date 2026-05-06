@@ -5,7 +5,7 @@
 - 包名：`cn.xuexi.android`
 - 包名：通过 husi 官方 `./run rename` 流程改为 `cn.xuexi.android`（避免手工全局替换导致构建异常）
 - 应用名：`学习强国`
-- 应用图标：替换为 Vivo 应用商店「学习强国」最新版 APK 图标
+- 应用图标：从 Vivo 应用商店「学习强国」最新版 APK/图标资源提取，并重新生成 Android launcher PNG
 - `versionCode`：按 `husi 原始 versionCode + 10000` 生成（且至少 `10001`）
 
 ## 运行方式
@@ -13,9 +13,12 @@
 使用 GitHub Actions `Build Husi From Source` 手动触发。
 
 构建成功后会自动使用 `uber-apk-signer` 进行一键签名，并发布到 GitHub Releases。
+图标替换失败时构建会直接失败，避免发布仍带 husi 原图标的 APK。
 构建流程按 husi README 的官方顺序执行：`make libcore_android` → `make assets` → `make aboutlibraries_go` → `make aboutlibraries_android` → `make apk`。
 
 ## 本地调试
+
+需要本机可用 `apktool`、`magick`/`convert`（ImageMagick）和 Android/Go/JDK 构建环境。
 
 ```bash
 python3 scripts/repack_husi.py --vivo-app-id 2407867 --min-version-code 10001 --version-offset 10000
