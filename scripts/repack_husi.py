@@ -32,7 +32,6 @@ HUSI_REPO = "https://codeberg.org/xchacha20-poly1305/husi"
 DEFAULT_COMPILE_SDK = 37
 DEFAULT_BUILD_TOOLS = "37.0.0"
 DEFAULT_PROVIDER_AUTHORITY_PREFIX = "cn.xuexi.android.plugin"
-ORIGINAL_HUSI_PLUGIN_AUTHORITY_PREFIX = "fr.husi.plugin."
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
 BITMAP_ICON_SUFFIXES = {".png", ".webp", ".jpg", ".jpeg", ".avif"}
 BUILD_TARGETS = ("app", "hysteria2", "juicity", "mieru", "naive", "shadowquic")
@@ -598,21 +597,17 @@ def patch_app_provider_authority_prefix(repo_dir: Path, provider_authority_prefi
         text,
         count=1,
     )
-    new_text = new_text.replace(
-        f'const val AUTHORITIES_PREFIX_HUSI_EXE = "{match_prefix}"',
-        (
-            f'const val AUTHORITIES_PREFIX_HUSI_EXE = "{match_prefix}"\n'
-            f'    const val AUTHORITIES_PREFIX_ORIGINAL_HUSI_EXE = "{ORIGINAL_HUSI_PLUGIN_AUTHORITY_PREFIX}"'
-        ),
-        1,
+    new_text = re.sub(
+        r'\n\s*const val AUTHORITIES_PREFIX_ORIGINAL_HUSI_EXE = "[^"]+"',
+        "",
+        new_text,
+        count=1,
     )
-    new_text = new_text.replace(
-        "val auth = pkg.providers!![0].authority ?: return false\n"
-        "        for (prefix in allowedSet) {",
-        "val auth = pkg.providers!![0].authority ?: return false\n"
-        "        if (auth.startsWith(AUTHORITIES_PREFIX_ORIGINAL_HUSI_EXE)) return false\n"
-        "        for (prefix in allowedSet) {",
-        1,
+    new_text = re.sub(
+        r'\n\s*if \(auth\.startsWith\(AUTHORITIES_PREFIX_ORIGINAL_HUSI_EXE\)\) return false',
+        "",
+        new_text,
+        count=1,
     )
     if not allow_compatible_plugin_prefixes:
         for const_name in (
@@ -621,9 +616,55 @@ def patch_app_provider_authority_prefix(repo_dir: Path, provider_authority_prefi
             "AUTHORITIES_PREFIX_DYHKWONG",
         ):
             new_text = re.sub(rf"\n\s*add\({const_name}\)", "", new_text, count=1)
-    if new_text == text:
+    if f'const val AUTHORITIES_PREFIX_HUSI_EXE = "{match_prefix}"' not in new_text:
         raise RuntimeError("未能替换 AUTHORITIES_PREFIX_HUSI_EXE")
     plugins_file.write_text(new_text, encoding="utf-8")
+    patch_custom_plugin_prefix_default(repo_dir, match_prefix)
+
+
+def kotlin_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def patch_custom_plugin_prefix_default(repo_dir: Path, match_prefix: str):
+    default_value = kotlin_string(match_prefix)
+
+    data_store_file = repo_dir / "composeApp" / "src" / "commonMain" / "kotlin" / "fr" / "husi" / "database" / "DataStore.kt"
+    if data_store_file.exists():
+        text = data_store_file.read_text(encoding="utf-8")
+        expected = f'var customPluginPrefix by configurationStore.string(Key.CUSTOM_PLUGIN_PREFIX) {{ "{default_value}" }}'
+        new_text = re.sub(
+            r"var customPluginPrefix by configurationStore\.string\(Key\.CUSTOM_PLUGIN_PREFIX\)(?:\s*\{\s*\"[^\"]*\"\s*\})?",
+            expected,
+            text,
+            count=1,
+        )
+        if new_text == text and expected not in text:
+            raise RuntimeError("未能设置 customPluginPrefix 默认值")
+        if new_text != text:
+            data_store_file.write_text(new_text, encoding="utf-8")
+
+    preferences_file = repo_dir / "composeApp" / "src" / "androidMain" / "kotlin" / "fr" / "husi" / "ui" / "PlatformPluginPreferences.android.kt"
+    if preferences_file.exists():
+        text = preferences_file.read_text(encoding="utf-8")
+        expected_flow = f'.stringFlow(Key.CUSTOM_PLUGIN_PREFIX, "{default_value}")'
+        expected_state = f'.collectAsStateWithLifecycle("{default_value}")'
+        new_text = re.sub(
+            r'\.stringFlow\(Key\.CUSTOM_PLUGIN_PREFIX,\s*"[^"]*"\)',
+            expected_flow,
+            text,
+            count=1,
+        )
+        new_text = re.sub(
+            r'\.collectAsStateWithLifecycle\("[^"]*"\)',
+            expected_state,
+            new_text,
+            count=1,
+        )
+        if new_text == text and (expected_flow not in text or expected_state not in text):
+            raise RuntimeError("未能设置自定义插件前缀界面默认值")
+        if new_text != text:
+            preferences_file.write_text(new_text, encoding="utf-8")
 
 
 def plugin_source_set_dir(repo_dir: Path, plugin: str) -> Path:
