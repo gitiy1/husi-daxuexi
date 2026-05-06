@@ -3,10 +3,30 @@ name: Build Husi From Source
 on:
   workflow_dispatch:
     inputs:
+      build_target:
+        description: "构建目标：app 为 husi 本体，其它为 husi 插件"
+        required: true
+        type: choice
+        default: "app"
+        options:
+          - app
+          - hysteria2
+          - juicity
+          - mieru
+          - naive
+          - shadowquic
       vivo_app_id:
-        description: "Vivo 学习强国 App ID（默认 2407867）"
+        description: "伪装 Vivo App ID（留空：本体默认 2407867，插件默认 284567）"
         required: false
-        default: "2407867"
+        default: ""
+      package_name:
+        description: "覆盖 package/applicationId（留空则自动取 Vivo package_name）"
+        required: false
+        default: ""
+      app_name:
+        description: "覆盖应用名（留空则自动取 Vivo title_zh/title_en）"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -51,7 +71,7 @@ jobs:
         run: |
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
           yes | sdkmanager --licenses
-          sdkmanager "platforms;android-23" "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865" "platform-tools"
+          sdkmanager "platforms;android-23" "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865" "platform-tools"
 
       - name: Install APK and icon tools
         run: |
@@ -60,12 +80,25 @@ jobs:
 
       - name: Build & sign APK from source (uber-apk-signer)
         env:
+          BUILD_TARGET: ${{ github.event.inputs.build_target }}
           VIVO_APP_ID: ${{ github.event.inputs.vivo_app_id }}
+          PACKAGE_NAME: ${{ github.event.inputs.package_name }}
+          APP_NAME: ${{ github.event.inputs.app_name }}
           ANDROID_HOME: /opt/android-sdk
           ANDROID_SDK_ROOT: /opt/android-sdk
           ANDROID_NDK_HOME: /opt/android-sdk/ndk/29.0.14206865
         run: |
-          python3 scripts/repack_husi.py --vivo-app-id "${VIVO_APP_ID:-2407867}" --min-version-code 10001 --version-offset 10000
+          args=(--target "${BUILD_TARGET:-app}" --min-version-code 10001 --version-offset 10000)
+          if [ -n "${VIVO_APP_ID}" ]; then
+            args+=(--vivo-app-id "${VIVO_APP_ID}")
+          fi
+          if [ -n "${PACKAGE_NAME}" ]; then
+            args+=(--package-name "${PACKAGE_NAME}")
+          fi
+          if [ -n "${APP_NAME}" ]; then
+            args+=(--app-name "${APP_NAME}")
+          fi
+          python3 scripts/repack_husi.py "${args[@]}"
 
       - name: Compute release tag
         id: vars
@@ -77,6 +110,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
-          name: Source-built husi ${{ steps.vars.outputs.tag }}
+          name: Source-built husi ${{ github.event.inputs.build_target }} ${{ steps.vars.outputs.tag }}
           generate_release_notes: true
           files: dist/*.apk
