@@ -31,6 +31,11 @@ on:
         description: "覆盖应用名（留空则自动取 Vivo title_zh/title_en）"
         required: false
         default: ""
+      allow_compatible_plugin_prefixes:
+        description: "是否继续识别 SagerNet/Matsuri/dyhkwong 等兼容插件前缀"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -89,6 +94,7 @@ jobs:
           PACKAGE_NAME: ${{ github.event.inputs.package_name }}
           APP_NAME: ${{ github.event.inputs.app_name }}
           PROVIDER_AUTHORITY_PREFIX: ${{ github.event.inputs.provider_authority_prefix }}
+          ALLOW_COMPATIBLE_PLUGIN_PREFIXES: ${{ github.event.inputs.allow_compatible_plugin_prefixes }}
           ANDROID_HOME: /opt/android-sdk
           ANDROID_SDK_ROOT: /opt/android-sdk
           ANDROID_NDK_HOME: /opt/android-sdk/ndk/29.0.14206865
@@ -103,6 +109,9 @@ jobs:
           fi
           if [ -n "${APP_NAME}" ]; then
             args+=(--app-name "${APP_NAME}")
+          fi
+          if [ "${ALLOW_COMPATIBLE_PLUGIN_PREFIXES}" = "true" ]; then
+            args+=(--allow-compatible-plugin-prefixes)
           fi
           python3 scripts/repack_husi.py "${args[@]}"
 
