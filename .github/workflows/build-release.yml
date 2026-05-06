@@ -28,7 +28,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -51,12 +51,12 @@ jobs:
         run: |
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
           yes | sdkmanager --licenses
-          sdkmanager "platforms;android-23" "platforms;android-37.0" "build-tools;37.0.0" "ndk;29.0.14206865" "platform-tools"
+          sdkmanager "platforms;android-23" "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865" "platform-tools"
 
-      - name: Install apktool
+      - name: Install APK and icon tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y apktool
+          sudo apt-get install -y apktool imagemagick webp
 
       - name: Build & sign APK from source (uber-apk-signer)
         env:
