@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 按 husi 官方 README 的构建顺序，从源码构建 APK，并做品牌定制：
-- PACKAGE_NAME -> cn.xuexi.android
-- app_name -> 学习强国
-- versionCode -> 原 VERSION_CODE + 10000（最小 10001）
-- 图标尝试替换为 Vivo 学习强国 APK 图标
+- 本体默认伪装 Vivo 学习强国（2407867），插件默认伪装 Vivo app id 284567
+- packageName/app name/versionCode 尽量从 Vivo 接口自动获取，也支持命令行覆盖
+- 图标替换为 Vivo 目标 APK/图标资源，并生成 Android launcher PNG
 - 使用 uber-apk-signer 一键签名
 """
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 import re
@@ -19,16 +19,21 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 VIVO_API_BASE = "https://h5-api.appstore.vivo.com.cn"
 VIVO_USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
     "Chrome/120.0.0.0 Mobile Safari/537.36"
 )
-DEFAULT_VIVO_APP_ID = "2407867"
+DEFAULT_APP_VIVO_APP_ID = "2407867"
+DEFAULT_PLUGIN_VIVO_APP_ID = "284567"
 HUSI_REPO = "https://codeberg.org/xchacha20-poly1305/husi"
+DEFAULT_COMPILE_SDK = 36
+DEFAULT_BUILD_TOOLS = "36.0.0"
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
 BITMAP_ICON_SUFFIXES = {".png", ".webp", ".jpg", ".jpeg", ".avif"}
+BUILD_TARGETS = ("app", "hysteria2", "juicity", "mieru", "naive", "shadowquic")
 LAUNCHER_ICON_SIZES = {
     "mipmap-mdpi": 48,
     "mipmap-hdpi": 72,
@@ -56,6 +61,20 @@ VIVO_ICON_URL_KEYS = (
     "appIcon",
 )
 VIVO_DOWNLOAD_URL_KEYS = ("download_url", "downloadUrl", "apk_url", "apkUrl", "download")
+VIVO_TITLE_KEYS = ("title_zh", "title_en", "name", "app_name", "appName")
+VIVO_PACKAGE_KEYS = ("package_name", "packageName", "pkg_name", "pkgName")
+VIVO_VERSION_CODE_KEYS = ("version_code", "versionCode")
+VIVO_VERSION_NAME_KEYS = ("version_name", "versionName")
+
+
+@dataclass(frozen=True)
+class BrandInfo:
+    vivo_app_id: str
+    package_name: str
+    app_name: str
+    version_code: int | None
+    version_name: str | None
+    raw: dict
 
 
 def run(cmd, cwd=None, env=None):
@@ -90,6 +109,74 @@ def get_first_url(data: dict, keys) -> str | None:
                 if isinstance(nested_value, str) and nested_value.startswith(("http://", "https://")):
                     return nested_value
     return None
+
+
+def get_first_string(data: dict, keys) -> str | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def get_first_int(data: dict, keys) -> int | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+    return None
+
+
+def optional_arg(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def validate_package_name(package_name: str):
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+", package_name):
+        raise ValueError(f"非法 Android package/applicationId: {package_name}")
+
+
+def safe_file_token(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
+    return token or "apk"
+
+
+def plugin_prop_prefix(plugin: str) -> str:
+    return plugin.upper().replace("-", "_")
+
+
+def choose_vivo_app_id(target: str, explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    return DEFAULT_APP_VIVO_APP_ID if target == "app" else DEFAULT_PLUGIN_VIVO_APP_ID
+
+
+def resolve_brand_info(
+    vivo_app_id: str,
+    info: dict,
+    package_name_override: str | None,
+    app_name_override: str | None,
+) -> BrandInfo:
+    package_name = package_name_override or get_first_string(info, VIVO_PACKAGE_KEYS)
+    app_name = app_name_override or get_first_string(info, VIVO_TITLE_KEYS)
+    if not package_name:
+        raise RuntimeError(f"Vivo API 未返回 package_name，请使用 --package-name 覆盖: {info}")
+    if not app_name:
+        app_name = package_name
+    validate_package_name(package_name)
+    return BrandInfo(
+        vivo_app_id=vivo_app_id,
+        package_name=package_name,
+        app_name=app_name,
+        version_code=get_first_int(info, VIVO_VERSION_CODE_KEYS),
+        version_name=get_first_string(info, VIVO_VERSION_NAME_KEYS),
+        raw=info,
+    )
 
 
 def find_imagemagick() -> str:
@@ -167,6 +254,14 @@ def clone_husi_source(workdir: Path) -> Path:
     return src
 
 
+def set_property(text: str, key: str, value: str | int) -> str:
+    replacement = f"{key}={value}"
+    pattern = rf"^{re.escape(key)}=.*$"
+    if re.search(pattern, text, flags=re.MULTILINE):
+        return re.sub(pattern, replacement, text, flags=re.MULTILINE)
+    return text.rstrip() + f"\n{replacement}\n"
+
+
 def read_husi_properties(props: Path):
     text = props.read_text(encoding="utf-8")
     pkg = re.search(r"^PACKAGE_NAME=(.+)$", text, re.MULTILINE).group(1).strip()
@@ -174,10 +269,32 @@ def read_husi_properties(props: Path):
     return pkg, vc, text
 
 
-def write_husi_properties(props: Path, package_name: str, version_code: int):
+def write_husi_properties(props: Path, package_name: str, version_code: int, version_name: str | None = None):
     text = props.read_text(encoding="utf-8")
-    text = re.sub(r"^PACKAGE_NAME=.*$", f"PACKAGE_NAME={package_name}", text, flags=re.MULTILINE)
-    text = re.sub(r"^VERSION_CODE=.*$", f"VERSION_CODE={version_code}", text, flags=re.MULTILINE)
+    text = set_property(text, "PACKAGE_NAME", package_name)
+    text = set_property(text, "VERSION_CODE", version_code)
+    if version_name:
+        text = set_property(text, "VERSION_NAME", version_name)
+    props.write_text(text, encoding="utf-8")
+
+
+def read_plugin_version(props: Path, plugin: str) -> tuple[str | None, int]:
+    text = props.read_text(encoding="utf-8")
+    prefix = plugin_prop_prefix(plugin)
+    version_name_match = re.search(rf"^{prefix}_VERSION_NAME=(.+)$", text, re.MULTILINE)
+    version_match = re.search(rf"^{prefix}_VERSION=(\d+)$", text, re.MULTILINE)
+    if not version_match:
+        raise RuntimeError(f"husi.properties 中未找到 {prefix}_VERSION")
+    version_name = version_name_match.group(1).strip() if version_name_match else None
+    return version_name, int(version_match.group(1))
+
+
+def write_plugin_properties(props: Path, plugin: str, version_code: int, version_name: str | None = None):
+    text = props.read_text(encoding="utf-8")
+    prefix = plugin_prop_prefix(plugin)
+    text = set_property(text, f"{prefix}_VERSION", version_code)
+    if version_name:
+        text = set_property(text, f"{prefix}_VERSION_NAME", version_name)
     props.write_text(text, encoding="utf-8")
 
 
@@ -186,7 +303,7 @@ def replace_app_name(repo_dir: Path, app_name: str):
         t = p.read_text(encoding="utf-8", errors="ignore")
         n = re.sub(
             r'(<string\s+name="app_name"[^>]*>)(.*?)(</string>)',
-            rf"\1{app_name}\3",
+            lambda m: f"{m.group(1)}{xml_escape(app_name)}{m.group(3)}",
             t,
             flags=re.DOTALL,
         )
@@ -278,14 +395,14 @@ def extract_apk_launcher_icon(decoded_dir: Path) -> Path:
     )
     if fallback:
         return fallback
-    raise RuntimeError("未能从学习强国 APK 中解析出可用的启动图标位图")
+    raise RuntimeError("未能从 Vivo APK 中解析出可用的启动图标位图")
 
 
-def download_vivo_store_icon(info: dict, workdir: Path) -> Path | None:
+def download_vivo_store_icon(info: dict, workdir: Path, prefix: str) -> Path | None:
     icon_url = get_first_url(info, VIVO_ICON_URL_KEYS)
     if not icon_url:
         return None
-    icon_path = workdir / "xuexi-store-icon"
+    icon_path = workdir / f"{safe_file_token(prefix)}-store-icon"
     suffix = Path(icon_url.split("?", 1)[0]).suffix
     if suffix.lower() in BITMAP_ICON_SUFFIXES:
         icon_path = icon_path.with_suffix(suffix)
@@ -302,8 +419,8 @@ def clear_existing_launcher_icons(res_dir: Path):
         target.unlink()
 
 
-def install_launcher_icons(repo_dir: Path, source_icon: Path) -> list[Path]:
-    res_dir = repo_dir / "composeApp" / "src" / "androidMain" / "res"
+def install_launcher_icons(source_set_dir: Path, source_icon: Path) -> list[Path]:
+    res_dir = source_set_dir / "res"
     clear_existing_launcher_icons(res_dir)
 
     generated = []
@@ -314,43 +431,42 @@ def install_launcher_icons(repo_dir: Path, source_icon: Path) -> list[Path]:
         convert_icon_to_png(source_icon, round_icon, size)
         generated.extend([icon, round_icon])
 
-    playstore_icon = repo_dir / "composeApp" / "src" / "androidMain" / "ic_launcher-playstore.png"
+    playstore_icon = source_set_dir / "ic_launcher-playstore.png"
     convert_icon_to_png(source_icon, playstore_icon, 512)
     generated.append(playstore_icon)
     return generated
 
 
-def replace_icons(repo_dir: Path, workdir: Path, vivo_app_id: str):
-    info = fetch_vivo_info(vivo_app_id)
-    version_code = info.get("version_code") or info.get("versionCode") or "latest"
+def replace_icons(source_set_dir: Path, workdir: Path, brand: BrandInfo, prefix: str):
+    version_code = brand.version_code or "latest"
     icon_sources = []
 
     try:
-        store_icon = download_vivo_store_icon(info, workdir)
+        store_icon = download_vivo_store_icon(brand.raw, workdir, prefix)
         if store_icon:
             icon_sources.append(store_icon)
     except Exception as e:
         print(f"WARN: Vivo 图标资源下载失败，将尝试从 APK 提取: {e}")
 
-    download_url = get_first_url(info, VIVO_DOWNLOAD_URL_KEYS)
+    download_url = get_first_url(brand.raw, VIVO_DOWNLOAD_URL_KEYS)
     if download_url:
         try:
-            vivo_apk = workdir / f"xuexi-{version_code}.apk"
+            vivo_apk = workdir / f"{safe_file_token(prefix)}-{version_code}.apk"
             download_file(download_url, vivo_apk)
-            decoded = workdir / "decoded-vivo"
+            decoded = workdir / f"decoded-{safe_file_token(prefix)}"
             run(["apktool", "d", "-f", str(vivo_apk), "-o", str(decoded)])
             icon_sources.append(extract_apk_launcher_icon(decoded))
         except Exception as e:
             if not icon_sources:
-                raise RuntimeError(f"从学习强国 APK 提取图标失败: {e}") from e
-            print(f"WARN: 从学习强国 APK 提取图标失败，将使用 Vivo 图标资源: {e}")
+                raise RuntimeError(f"从 Vivo APK 提取图标失败: {e}") from e
+            print(f"WARN: 从 Vivo APK 提取图标失败，将使用 Vivo 图标资源: {e}")
     elif not icon_sources:
-        raise RuntimeError(f"Vivo API 未返回 APK 下载地址或图标资源: {info}")
+        raise RuntimeError(f"Vivo API 未返回 APK 下载地址或图标资源: {brand.raw}")
 
     source_icon = max(icon_sources, key=bitmap_score)
 
-    generated = install_launcher_icons(repo_dir, source_icon)
-    print(f"INFO: 已用 {source_icon} 生成 {len(generated)} 个学习强国启动图标资源")
+    generated = install_launcher_icons(source_set_dir, source_icon)
+    print(f"INFO: 已用 {source_icon} 为 {brand.app_name} 生成 {len(generated)} 个启动图标资源")
 
 
 def ensure_android_local_properties(repo_dir: Path):
@@ -360,6 +476,59 @@ def ensure_android_local_properties(repo_dir: Path):
     if ndk:
         lines.append(f"ndk.dir={ndk}")
     (repo_dir / "local.properties").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def patch_android_sdk_versions(repo_dir: Path, compile_sdk: int, build_tools: str):
+    replacements = [
+        (repo_dir / "buildSrc" / "src" / "main" / "kotlin" / "Helpers.kt", r'buildToolsVersion = "\d+(?:\.\d+)*"', f'buildToolsVersion = "{build_tools}"'),
+        (repo_dir / "buildSrc" / "src" / "main" / "kotlin" / "Helpers.kt", r"compileSdk = \d+", f"compileSdk = {compile_sdk}"),
+        (repo_dir / "composeApp" / "build.gradle.kts", r"compileSdk = \d+", f"compileSdk = {compile_sdk}"),
+    ]
+    for path, pattern, replacement in replacements:
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        new_text = re.sub(pattern, replacement, text)
+        if new_text != text:
+            path.write_text(new_text, encoding="utf-8")
+
+
+def plugin_source_set_dir(repo_dir: Path, plugin: str) -> Path:
+    path = repo_dir / "plugin" / plugin / "src" / "main"
+    if not path.is_dir():
+        raise RuntimeError(f"未知或不存在的插件: {plugin}")
+    return path
+
+
+def replace_plugin_brand(repo_dir: Path, plugin: str, brand: BrandInfo):
+    plugin_dir = repo_dir / "plugin" / plugin
+    build_gradle = plugin_dir / "build.gradle.kts"
+    manifest = plugin_dir / "src" / "main" / "AndroidManifest.xml"
+
+    text = build_gradle.read_text(encoding="utf-8")
+    text = re.sub(
+        r'applicationId\s*=\s*"[^"]+"',
+        f'applicationId = "{brand.package_name}"',
+        text,
+        count=1,
+    )
+    build_gradle.write_text(text, encoding="utf-8")
+
+    authority = f"fr.husi.plugin.{brand.package_name}.{plugin}.BinaryProvider"
+    text = manifest.read_text(encoding="utf-8")
+    text = re.sub(
+        r'android:label="[^"]*"',
+        lambda _: f'android:label="{xml_escape(brand.app_name)}"',
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r'android:authorities="[^"]+"',
+        f'android:authorities="{authority}"',
+        text,
+        count=1,
+    )
+    manifest.write_text(text, encoding="utf-8")
 
 
 def build_apk_official_flow(repo_dir: Path):
@@ -387,7 +556,18 @@ def build_apk_official_flow(repo_dir: Path):
     return apks[0]
 
 
-def sign_with_uber(unsigned_apk: Path, workdir: Path, outdir: Path, version_code: int) -> Path:
+def build_plugin_flow(repo_dir: Path, plugin: str):
+    run(["make", "plugin", f"PLUGIN={plugin}"], cwd=repo_dir)
+    apks = list((repo_dir / "plugin" / plugin / "build" / "outputs" / "apk").rglob("*.apk"))
+    if not apks:
+        raise RuntimeError(f"未找到 {plugin} 插件 APK 产物")
+    for p in apks:
+        if "release" in str(p).lower():
+            return p
+    return apks[0]
+
+
+def sign_with_uber(unsigned_apk: Path, workdir: Path, outdir: Path, version_code: int, target: str, package_name: str) -> Path:
     jar = workdir / "uber-apk-signer.jar"
     download_file(
         "https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar",
@@ -400,30 +580,39 @@ def sign_with_uber(unsigned_apk: Path, workdir: Path, outdir: Path, version_code
     if not signed.exists():
         raise RuntimeError("未找到 uber-apk-signer 输出")
     outdir.mkdir(parents=True, exist_ok=True)
-    final_apk = outdir / f"husi-xuexi-cn.xuexi.android-vc{version_code}.apk"
+    final_apk = outdir / f"husi-{safe_file_token(target)}-{safe_file_token(package_name)}-vc{version_code}.apk"
     shutil.copy2(signed, final_apk)
     return final_apk
 
 
-def compute_version_code(old_vc: int, offset: int, min_code: int):
-    return max(min_code, old_vc + offset)
+def compute_version_code(old_vc: int, offset: int, min_code: int, spoof_vc: int | None = None):
+    candidates = [min_code, old_vc + offset]
+    if spoof_vc:
+        candidates.append(spoof_vc)
+    return max(candidates)
 
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--target", choices=BUILD_TARGETS, default=os.environ.get("BUILD_TARGET", "app"))
     p.add_argument("--workdir", default="build/work")
     p.add_argument("--outdir", default="dist")
-    p.add_argument("--package-name", default="cn.xuexi.android")
-    p.add_argument("--app-name", default="学习强国")
-    p.add_argument("--vivo-app-id", default=os.environ.get("VIVO_APP_ID", DEFAULT_VIVO_APP_ID))
+    p.add_argument("--package-name", default=os.environ.get("PACKAGE_NAME"))
+    p.add_argument("--app-name", default=os.environ.get("APP_NAME"))
+    p.add_argument("--vivo-app-id", default=os.environ.get("VIVO_APP_ID"))
     p.add_argument("--version-offset", type=int, default=10000)
     p.add_argument("--min-version-code", type=int, default=10001)
+    p.add_argument("--compile-sdk", type=int, default=DEFAULT_COMPILE_SDK)
+    p.add_argument("--build-tools", default=DEFAULT_BUILD_TOOLS)
     p.add_argument(
         "--allow-icon-fallback",
         action="store_true",
-        help="图标替换失败时继续构建；默认失败退出，避免发布旧 husi 图标",
+        help="图标替换失败时继续构建；默认失败退出，避免发布旧图标",
     )
     args = p.parse_args()
+    args.package_name = optional_arg(args.package_name)
+    args.app_name = optional_arg(args.app_name)
+    args.vivo_app_id = choose_vivo_app_id(args.target, optional_arg(args.vivo_app_id))
 
     workdir = Path(args.workdir)
     outdir = Path(args.outdir)
@@ -431,26 +620,62 @@ def main():
     workdir.mkdir(parents=True, exist_ok=True)
 
     repo = clone_husi_source(workdir)
+    patch_android_sdk_versions(repo, args.compile_sdk, args.build_tools)
+
+    info = fetch_vivo_info(args.vivo_app_id)
+    brand = resolve_brand_info(args.vivo_app_id, info, args.package_name, args.app_name)
+
     props = repo / "husi.properties"
-    old_pkg, old_vc, _ = read_husi_properties(props)
-    new_vc = compute_version_code(old_vc, args.version_offset, args.min_version_code)
-    write_husi_properties(props, args.package_name, new_vc)
-
-    # 使用官方 rename 流程（README 提供）
-    run(["./run", "rename", args.package_name], cwd=repo)
-    replace_app_name(repo, args.app_name)
-    try:
-        replace_icons(repo, workdir, args.vivo_app_id)
-    except Exception as e:
-        if args.allow_icon_fallback:
-            print(f"WARN: 图标替换失败，将继续构建: {e}")
-        else:
-            raise RuntimeError(f"图标替换失败，已停止构建以避免发布旧 husi 图标: {e}") from e
-
     ensure_android_local_properties(repo)
-    unsigned = build_apk_official_flow(repo)
-    signed = sign_with_uber(unsigned, workdir, outdir, new_vc)
-    print(json.dumps({"apk": str(signed), "version_code": new_vc, "old_package": old_pkg}, ensure_ascii=False))
+
+    if args.target == "app":
+        old_pkg, old_vc, _ = read_husi_properties(props)
+        new_vc = compute_version_code(old_vc, args.version_offset, args.min_version_code, brand.version_code)
+        write_husi_properties(props, brand.package_name, new_vc, brand.version_name)
+
+        # 使用官方 rename 流程（README 提供）
+        run(["./run", "rename", brand.package_name], cwd=repo)
+        replace_app_name(repo, brand.app_name)
+        try:
+            replace_icons(repo / "composeApp" / "src" / "androidMain", workdir, brand, args.target)
+        except Exception as e:
+            if args.allow_icon_fallback:
+                print(f"WARN: 图标替换失败，将继续构建: {e}")
+            else:
+                raise RuntimeError(f"图标替换失败，已停止构建以避免发布旧图标: {e}") from e
+        unsigned = build_apk_official_flow(repo)
+        old_package = old_pkg
+    else:
+        _, old_vc = read_plugin_version(props, args.target)
+        new_vc = compute_version_code(old_vc, args.version_offset, args.min_version_code, brand.version_code)
+        write_plugin_properties(props, args.target, new_vc, brand.version_name)
+        replace_plugin_brand(repo, args.target, brand)
+        try:
+            replace_icons(plugin_source_set_dir(repo, args.target), workdir, brand, args.target)
+        except Exception as e:
+            if args.allow_icon_fallback:
+                print(f"WARN: 图标替换失败，将继续构建: {e}")
+            else:
+                raise RuntimeError(f"图标替换失败，已停止构建以避免发布旧图标: {e}") from e
+        unsigned = build_plugin_flow(repo, args.target)
+        old_package = f"fr.husi.plugin.{args.target}"
+
+    signed = sign_with_uber(unsigned, workdir, outdir, new_vc, args.target, brand.package_name)
+    print(
+        json.dumps(
+            {
+                "apk": str(signed),
+                "target": args.target,
+                "vivo_app_id": brand.vivo_app_id,
+                "package_name": brand.package_name,
+                "app_name": brand.app_name,
+                "version_code": new_vc,
+                "vivo_version_code": brand.version_code,
+                "old_package": old_package,
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
