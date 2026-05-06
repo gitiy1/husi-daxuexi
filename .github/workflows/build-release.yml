@@ -27,6 +27,10 @@ on:
         description: "覆盖应用名（留空则自动取 Vivo title_zh/title_en）"
         required: false
         default: ""
+      provider_authority_prefix:
+        description: "插件 provider authority 前缀"
+        required: false
+        default: "cn.xuexi.android.plugin"
 
 permissions:
   contents: write
@@ -70,8 +74,8 @@ jobs:
           ANDROID_SDK_ROOT: /opt/android-sdk
         run: |
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
-          yes | sdkmanager --licenses
-          sdkmanager "platforms;android-23" "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865" "platform-tools"
+          yes | sdkmanager --licenses --channel=3
+          sdkmanager --channel=3 "platforms;android-23" "platforms;android-37.0" "build-tools;36.0.0" "build-tools;37.0.0" "ndk;29.0.14206865" "platform-tools"
 
       - name: Install APK and icon tools
         run: |
@@ -84,11 +88,13 @@ jobs:
           VIVO_APP_ID: ${{ github.event.inputs.vivo_app_id }}
           PACKAGE_NAME: ${{ github.event.inputs.package_name }}
           APP_NAME: ${{ github.event.inputs.app_name }}
+          PROVIDER_AUTHORITY_PREFIX: ${{ github.event.inputs.provider_authority_prefix }}
           ANDROID_HOME: /opt/android-sdk
           ANDROID_SDK_ROOT: /opt/android-sdk
           ANDROID_NDK_HOME: /opt/android-sdk/ndk/29.0.14206865
         run: |
           args=(--target "${BUILD_TARGET:-app}" --min-version-code 10001 --version-offset 10000)
+          args+=(--provider-authority-prefix "${PROVIDER_AUTHORITY_PREFIX:-cn.xuexi.android.plugin}")
           if [ -n "${VIVO_APP_ID}" ]; then
             args+=(--vivo-app-id "${VIVO_APP_ID}")
           fi
