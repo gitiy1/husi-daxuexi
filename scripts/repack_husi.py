@@ -29,11 +29,23 @@ VIVO_USER_AGENT = (
 DEFAULT_APP_VIVO_APP_ID = "2407867"
 DEFAULT_PLUGIN_VIVO_APP_ID = "284567"
 HUSI_REPO = "https://codeberg.org/xchacha20-poly1305/husi"
-DEFAULT_COMPILE_SDK = 36
-DEFAULT_BUILD_TOOLS = "36.0.0"
+DEFAULT_COMPILE_SDK = 37
+DEFAULT_BUILD_TOOLS = "37.0.0"
+DEFAULT_PROVIDER_AUTHORITY_PREFIX = "cn.xuexi.android.plugin"
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
 BITMAP_ICON_SUFFIXES = {".png", ".webp", ".jpg", ".jpeg", ".avif"}
 BUILD_TARGETS = ("app", "hysteria2", "juicity", "mieru", "naive", "shadowquic")
+COMMON_SUBMODULES = (
+    "library/DragDropSwipeLazyColumn",
+    "library/compose-code-editor",
+)
+PLUGIN_SUBMODULES = {
+    "hysteria2": ("plugin/hysteria2/src/main/go/hysteria2",),
+    "juicity": ("plugin/juicity/src/main/go/juicity",),
+    "mieru": ("plugin/mieru/src/main/go/mieru",),
+    "naive": ("plugin/naive/src/main/jni/naiveproxy",),
+    "shadowquic": ("plugin/shadowquic/src/main/rust/shadowquic",),
+}
 LAUNCHER_ICON_SIZES = {
     "mipmap-mdpi": 48,
     "mipmap-hdpi": 72,
@@ -80,6 +92,33 @@ class BrandInfo:
 def run(cmd, cwd=None, env=None):
     print("+", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=cwd, env=env)
+
+
+def go_env_value(name: str) -> str | None:
+    try:
+        value = subprocess.check_output(["go", "env", name], text=True, stderr=subprocess.DEVNULL).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    return value or None
+
+
+def husi_build_env() -> dict[str, str]:
+    env = os.environ.copy()
+    candidates: list[str] = []
+
+    gobin = go_env_value("GOBIN")
+    if gobin:
+        candidates.append(gobin)
+
+    gopath = go_env_value("GOPATH")
+    if gopath:
+        candidates.extend(str(Path(path) / "bin") for path in gopath.split(os.pathsep) if path)
+
+    path_parts = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+    prepend = [path for path in candidates if path and path not in path_parts]
+    if prepend:
+        env["PATH"] = os.pathsep.join(prepend + path_parts)
+    return env
 
 
 def fetch_json(url, headers=None):
@@ -139,6 +178,23 @@ def optional_arg(value: str | None) -> str | None:
 def validate_package_name(package_name: str):
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+", package_name):
         raise ValueError(f"非法 Android package/applicationId: {package_name}")
+
+
+def normalize_provider_authority_prefix(prefix: str | None) -> str:
+    prefix = (prefix or DEFAULT_PROVIDER_AUTHORITY_PREFIX).strip().rstrip(".")
+    validate_package_name(prefix)
+    return prefix
+
+
+def provider_authority_match_prefix(prefix: str) -> str:
+    return normalize_provider_authority_prefix(prefix) + "."
+
+
+def required_submodules(target: str) -> list[str]:
+    submodules = list(COMMON_SUBMODULES)
+    if target != "app":
+        submodules.extend(PLUGIN_SUBMODULES.get(target, ()))
+    return submodules
 
 
 def safe_file_token(value: str) -> str:
@@ -240,7 +296,7 @@ def convert_icon_to_png(source: Path, target: Path, size: int):
     )
 
 
-def clone_husi_source(workdir: Path) -> Path:
+def clone_husi_source(workdir: Path, target: str) -> Path:
     src = workdir / "husi-src"
     run(["git", "clone", "--depth", "1", HUSI_REPO, str(src)])
     gitmodules = src / ".gitmodules"
@@ -250,7 +306,7 @@ def clone_husi_source(workdir: Path) -> Path:
         if n != t:
             gitmodules.write_text(n, encoding="utf-8")
             run(["git", "submodule", "sync", "--recursive"], cwd=src)
-    run(["git", "submodule", "update", "--init", "--recursive"], cwd=src)
+    run(["git", "submodule", "update", "--init", "--recursive", *required_submodules(target)], cwd=src)
     return src
 
 
@@ -478,12 +534,44 @@ def ensure_android_local_properties(repo_dir: Path):
     (repo_dir / "local.properties").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def android_sdk_dir() -> Path:
+    return Path(os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or "/opt/android-sdk")
+
+
+def android_platform_exists(sdk_dir: Path, api_level: int) -> bool:
+    platform_dir = sdk_dir / "platforms"
+    candidates = (platform_dir / f"android-{api_level}", platform_dir / f"android-{api_level}.0")
+    return any((candidate / "android.jar").is_file() for candidate in candidates)
+
+
+def suggested_platform_package(api_level: int) -> str:
+    suffix = f"{api_level}.0" if api_level >= 37 else str(api_level)
+    return f"platforms;android-{suffix}"
+
+
+def require_android_sdk_platforms(compile_sdk: int):
+    sdk_dir = android_sdk_dir()
+    required = [23, compile_sdk]
+    missing = [api for api in required if not android_platform_exists(sdk_dir, api)]
+    if not missing:
+        return
+
+    packages = " ".join(f'"{suggested_platform_package(api)}"' for api in missing)
+    raise RuntimeError(
+        f"Android SDK 缺少平台 {', '.join(map(str, missing))}（SDK: {sdk_dir}）。"
+        f"请先安装：sdkmanager --channel=3 {packages}"
+    )
+
+
 def patch_android_sdk_versions(repo_dir: Path, compile_sdk: int, build_tools: str):
     replacements = [
         (repo_dir / "buildSrc" / "src" / "main" / "kotlin" / "Helpers.kt", r'buildToolsVersion = "\d+(?:\.\d+)*"', f'buildToolsVersion = "{build_tools}"'),
         (repo_dir / "buildSrc" / "src" / "main" / "kotlin" / "Helpers.kt", r"compileSdk = \d+", f"compileSdk = {compile_sdk}"),
-        (repo_dir / "composeApp" / "build.gradle.kts", r"compileSdk = \d+", f"compileSdk = {compile_sdk}"),
     ]
+    replacements.extend(
+        (path, r"compileSdk = \d+", f"compileSdk = {compile_sdk}")
+        for path in repo_dir.rglob("build.gradle.kts")
+    )
     for path, pattern, replacement in replacements:
         if not path.exists():
             continue
@@ -493,6 +581,23 @@ def patch_android_sdk_versions(repo_dir: Path, compile_sdk: int, build_tools: st
             path.write_text(new_text, encoding="utf-8")
 
 
+def patch_app_provider_authority_prefix(repo_dir: Path, provider_authority_prefix: str):
+    plugins_file = repo_dir / "composeApp" / "src" / "androidMain" / "kotlin" / "fr" / "husi" / "plugin" / "Plugins.kt"
+    if not plugins_file.exists():
+        raise RuntimeError(f"未找到 husi 插件识别文件: {plugins_file}")
+    text = plugins_file.read_text(encoding="utf-8")
+    match_prefix = provider_authority_match_prefix(provider_authority_prefix)
+    new_text = re.sub(
+        r'const val AUTHORITIES_PREFIX_HUSI_EXE = "[^"]+"',
+        f'const val AUTHORITIES_PREFIX_HUSI_EXE = "{match_prefix}"',
+        text,
+        count=1,
+    )
+    if new_text == text:
+        raise RuntimeError("未能替换 AUTHORITIES_PREFIX_HUSI_EXE")
+    plugins_file.write_text(new_text, encoding="utf-8")
+
+
 def plugin_source_set_dir(repo_dir: Path, plugin: str) -> Path:
     path = repo_dir / "plugin" / plugin / "src" / "main"
     if not path.is_dir():
@@ -500,7 +605,7 @@ def plugin_source_set_dir(repo_dir: Path, plugin: str) -> Path:
     return path
 
 
-def replace_plugin_brand(repo_dir: Path, plugin: str, brand: BrandInfo):
+def replace_plugin_brand(repo_dir: Path, plugin: str, brand: BrandInfo, provider_authority_prefix: str):
     plugin_dir = repo_dir / "plugin" / plugin
     build_gradle = plugin_dir / "build.gradle.kts"
     manifest = plugin_dir / "src" / "main" / "AndroidManifest.xml"
@@ -514,7 +619,7 @@ def replace_plugin_brand(repo_dir: Path, plugin: str, brand: BrandInfo):
     )
     build_gradle.write_text(text, encoding="utf-8")
 
-    authority = f"fr.husi.plugin.{brand.package_name}.{plugin}.BinaryProvider"
+    authority = f"{normalize_provider_authority_prefix(provider_authority_prefix)}.{brand.package_name}.{plugin}.BinaryProvider"
     text = manifest.read_text(encoding="utf-8")
     text = re.sub(
         r'android:label="[^"]*"',
@@ -533,10 +638,11 @@ def replace_plugin_brand(repo_dir: Path, plugin: str, brand: BrandInfo):
 
 def build_apk_official_flow(repo_dir: Path):
     # 严格按 README 推荐顺序
-    run(["make", "libcore_android"], cwd=repo_dir)
-    run(["make", "assets"], cwd=repo_dir)
-    run(["make", "aboutlibraries_go"], cwd=repo_dir)
-    run(["make", "aboutlibraries_android"], cwd=repo_dir)
+    env = husi_build_env()
+    run(["make", "libcore_android"], cwd=repo_dir, env=env)
+    run(["make", "assets"], cwd=repo_dir, env=env)
+    run(["make", "aboutlibraries_go"], cwd=repo_dir, env=env)
+    run(["make", "aboutlibraries_android"], cwd=repo_dir, env=env)
     # README 中 desktop jar 缺失会导致 android 编译阶段失败，这里放一个最小占位 jar
     libs = repo_dir / "composeApp" / "libs"
     libs.mkdir(parents=True, exist_ok=True)
@@ -544,45 +650,69 @@ def build_apk_official_flow(repo_dir: Path):
     if not placeholder.exists():
         with zipfile.ZipFile(placeholder, "w"):
             pass
-    run(["make", "apk"], cwd=repo_dir)
+    run(["make", "apk"], cwd=repo_dir, env=env)
 
-    apks = list((repo_dir / "androidApp" / "build" / "outputs" / "apk").rglob("*.apk"))
+    return collect_output_apks(repo_dir / "androidApp" / "build" / "outputs" / "apk", "APK")
+
+
+def collect_output_apks(output_dir: Path, label: str) -> list[Path]:
+    apks = sorted(output_dir.rglob("*.apk"))
     if not apks:
         raise RuntimeError("未找到 APK 产物")
-    # 优先 release
-    for p in apks:
-        if "release" in str(p).lower():
-            return p
-    return apks[0]
+    release_apks = [p for p in apks if "release" in str(p).lower()]
+    selected = release_apks or apks
+    print(f"INFO: 找到 {len(selected)} 个 {label} 产物")
+    return selected
 
 
 def build_plugin_flow(repo_dir: Path, plugin: str):
-    run(["make", "plugin", f"PLUGIN={plugin}"], cwd=repo_dir)
-    apks = list((repo_dir / "plugin" / plugin / "build" / "outputs" / "apk").rglob("*.apk"))
-    if not apks:
-        raise RuntimeError(f"未找到 {plugin} 插件 APK 产物")
-    for p in apks:
-        if "release" in str(p).lower():
-            return p
-    return apks[0]
+    run(["make", "plugin", f"PLUGIN={plugin}"], cwd=repo_dir, env=husi_build_env())
+    return collect_output_apks(repo_dir / "plugin" / plugin / "build" / "outputs" / "apk", f"{plugin} 插件 APK")
 
 
-def sign_with_uber(unsigned_apk: Path, workdir: Path, outdir: Path, version_code: int, target: str, package_name: str) -> Path:
+def download_uber_signer(workdir: Path) -> Path:
     jar = workdir / "uber-apk-signer.jar"
-    download_file(
-        "https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar",
-        jar,
-    )
-    run(["java", "-jar", str(jar), "-a", str(unsigned_apk), "--overwrite"])
+    if not jar.exists():
+        download_file(
+            "https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar",
+            jar,
+        )
+    return jar
+
+
+def apk_variant_token(unsigned_apk: Path) -> str:
+    stem = unsigned_apk.stem.replace("-unsigned", "")
+    for abi in ("arm64-v8a", "armeabi-v7a", "x86_64", "x86"):
+        if abi in stem:
+            return abi
+    return safe_file_token(stem)
+
+
+def sign_with_uber(unsigned_apk: Path, signer_jar: Path, outdir: Path, version_code: int, target: str, package_name: str) -> Path:
+    run(["java", "-jar", str(signer_jar), "-a", str(unsigned_apk), "--overwrite"])
     signed = unsigned_apk.with_name(unsigned_apk.stem + "-aligned-debugSigned.apk")
     if not signed.exists():
         signed = unsigned_apk
     if not signed.exists():
         raise RuntimeError("未找到 uber-apk-signer 输出")
     outdir.mkdir(parents=True, exist_ok=True)
-    final_apk = outdir / f"husi-{safe_file_token(target)}-{safe_file_token(package_name)}-vc{version_code}.apk"
+    variant = apk_variant_token(unsigned_apk)
+    final_apk = outdir / f"husi-{safe_file_token(target)}-{safe_file_token(package_name)}-{variant}-vc{version_code}.apk"
     shutil.copy2(signed, final_apk)
     return final_apk
+
+
+def sign_apks_with_uber(unsigned_apks: list[Path], workdir: Path, outdir: Path, version_code: int, target: str, package_name: str) -> list[Path]:
+    signer_jar = download_uber_signer(workdir)
+    return [sign_with_uber(apk, signer_jar, outdir, version_code, target, package_name) for apk in unsigned_apks]
+
+
+def clear_previous_outputs(outdir: Path, version_code: int, target: str, package_name: str):
+    if not outdir.exists():
+        return
+    base = f"husi-{safe_file_token(target)}-{safe_file_token(package_name)}"
+    for apk in outdir.glob(f"{base}*vc{version_code}.apk"):
+        apk.unlink()
 
 
 def compute_version_code(old_vc: int, offset: int, min_code: int, spoof_vc: int | None = None):
@@ -605,6 +735,11 @@ def main():
     p.add_argument("--compile-sdk", type=int, default=DEFAULT_COMPILE_SDK)
     p.add_argument("--build-tools", default=DEFAULT_BUILD_TOOLS)
     p.add_argument(
+        "--provider-authority-prefix",
+        default=os.environ.get("PROVIDER_AUTHORITY_PREFIX", DEFAULT_PROVIDER_AUTHORITY_PREFIX),
+        help=f"插件 provider authority 前缀；默认 {DEFAULT_PROVIDER_AUTHORITY_PREFIX}",
+    )
+    p.add_argument(
         "--allow-icon-fallback",
         action="store_true",
         help="图标替换失败时继续构建；默认失败退出，避免发布旧图标",
@@ -613,13 +748,16 @@ def main():
     args.package_name = optional_arg(args.package_name)
     args.app_name = optional_arg(args.app_name)
     args.vivo_app_id = choose_vivo_app_id(args.target, optional_arg(args.vivo_app_id))
+    args.provider_authority_prefix = normalize_provider_authority_prefix(args.provider_authority_prefix)
 
     workdir = Path(args.workdir)
     outdir = Path(args.outdir)
     shutil.rmtree(workdir, ignore_errors=True)
     workdir.mkdir(parents=True, exist_ok=True)
 
-    repo = clone_husi_source(workdir)
+    require_android_sdk_platforms(args.compile_sdk)
+
+    repo = clone_husi_source(workdir, args.target)
     patch_android_sdk_versions(repo, args.compile_sdk, args.build_tools)
 
     info = fetch_vivo_info(args.vivo_app_id)
@@ -632,6 +770,7 @@ def main():
         old_pkg, old_vc, _ = read_husi_properties(props)
         new_vc = compute_version_code(old_vc, args.version_offset, args.min_version_code, brand.version_code)
         write_husi_properties(props, brand.package_name, new_vc, brand.version_name)
+        patch_app_provider_authority_prefix(repo, args.provider_authority_prefix)
 
         # 使用官方 rename 流程（README 提供）
         run(["./run", "rename", brand.package_name], cwd=repo)
@@ -643,13 +782,13 @@ def main():
                 print(f"WARN: 图标替换失败，将继续构建: {e}")
             else:
                 raise RuntimeError(f"图标替换失败，已停止构建以避免发布旧图标: {e}") from e
-        unsigned = build_apk_official_flow(repo)
+        unsigned_apks = build_apk_official_flow(repo)
         old_package = old_pkg
     else:
         _, old_vc = read_plugin_version(props, args.target)
         new_vc = compute_version_code(old_vc, args.version_offset, args.min_version_code, brand.version_code)
         write_plugin_properties(props, args.target, new_vc, brand.version_name)
-        replace_plugin_brand(repo, args.target, brand)
+        replace_plugin_brand(repo, args.target, brand, args.provider_authority_prefix)
         try:
             replace_icons(plugin_source_set_dir(repo, args.target), workdir, brand, args.target)
         except Exception as e:
@@ -657,20 +796,23 @@ def main():
                 print(f"WARN: 图标替换失败，将继续构建: {e}")
             else:
                 raise RuntimeError(f"图标替换失败，已停止构建以避免发布旧图标: {e}") from e
-        unsigned = build_plugin_flow(repo, args.target)
+        unsigned_apks = build_plugin_flow(repo, args.target)
         old_package = f"fr.husi.plugin.{args.target}"
 
-    signed = sign_with_uber(unsigned, workdir, outdir, new_vc, args.target, brand.package_name)
+    clear_previous_outputs(outdir, new_vc, args.target, brand.package_name)
+    signed_apks = sign_apks_with_uber(unsigned_apks, workdir, outdir, new_vc, args.target, brand.package_name)
     print(
         json.dumps(
             {
-                "apk": str(signed),
+                "apk": str(signed_apks[0]),
+                "apks": [str(apk) for apk in signed_apks],
                 "target": args.target,
                 "vivo_app_id": brand.vivo_app_id,
                 "package_name": brand.package_name,
                 "app_name": brand.app_name,
                 "version_code": new_vc,
                 "vivo_version_code": brand.version_code,
+                "provider_authority_prefix": args.provider_authority_prefix,
                 "old_package": old_package,
             },
             ensure_ascii=False,
