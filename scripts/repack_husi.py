@@ -32,6 +32,8 @@ HUSI_REPO = "https://codeberg.org/xchacha20-poly1305/husi"
 DEFAULT_COMPILE_SDK = 37
 DEFAULT_BUILD_TOOLS = "37.0.0"
 DEFAULT_PROVIDER_AUTHORITY_PREFIX = "cn.xuexi.android.plugin"
+DEFAULT_KEYSTORE_PASS = "android"
+DEFAULT_KEY_ALIAS = "husi-build"
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
 BITMAP_ICON_SUFFIXES = {".png", ".webp", ".jpg", ".jpeg", ".avif"}
 BUILD_TARGETS = ("app", "hysteria2", "juicity", "mieru", "naive", "shadowquic")
@@ -535,7 +537,76 @@ def ensure_android_local_properties(repo_dir: Path):
     lines = [f"sdk.dir={sdk}"]
     if ndk:
         lines.append(f"ndk.dir={ndk}")
+    lines.extend(
+        [
+            f"KEYSTORE_PASS={DEFAULT_KEYSTORE_PASS}",
+            f"ALIAS_NAME={DEFAULT_KEY_ALIAS}",
+            f"ALIAS_PASS={DEFAULT_KEYSTORE_PASS}",
+        ]
+    )
     (repo_dir / "local.properties").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    ensure_release_keystore(repo_dir)
+
+
+def ensure_release_keystore(repo_dir: Path):
+    keystore = repo_dir / "release.keystore"
+    keytool = find_keytool()
+    if keystore.exists():
+        if keystore_is_usable(keytool, keystore):
+            return
+        keystore.unlink()
+    run(
+        [
+            keytool,
+            "-genkeypair",
+            "-v",
+            "-keystore",
+            str(keystore),
+            "-storepass",
+            DEFAULT_KEYSTORE_PASS,
+            "-alias",
+            DEFAULT_KEY_ALIAS,
+            "-keypass",
+            DEFAULT_KEYSTORE_PASS,
+            "-keyalg",
+            "RSA",
+            "-keysize",
+            "2048",
+            "-validity",
+            "10000",
+            "-dname",
+            "CN=Husi Build,O=Local,C=US",
+        ]
+    )
+
+
+def find_keytool() -> str:
+    keytool = shutil.which("keytool")
+    if not keytool:
+        java_home = os.environ.get("JAVA_HOME")
+        candidate = Path(java_home) / "bin" / "keytool" if java_home else None
+        if candidate and candidate.exists():
+            keytool = str(candidate)
+    if not keytool:
+        raise RuntimeError("未找到 keytool，无法生成临时 release keystore")
+    return keytool
+
+
+def keystore_is_usable(keytool: str, keystore: Path) -> bool:
+    return subprocess.run(
+        [
+            keytool,
+            "-list",
+            "-keystore",
+            str(keystore),
+            "-storepass",
+            DEFAULT_KEYSTORE_PASS,
+            "-alias",
+            DEFAULT_KEY_ALIAS,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
 
 
 def android_sdk_dir() -> Path:
@@ -758,7 +829,7 @@ def apk_variant_token(unsigned_apk: Path) -> str:
 
 
 def sign_with_uber(unsigned_apk: Path, signer_jar: Path, outdir: Path, version_code: int, target: str, package_name: str) -> Path:
-    run(["java", "-jar", str(signer_jar), "-a", str(unsigned_apk), "--overwrite"])
+    run(["java", "-jar", str(signer_jar), "-a", str(unsigned_apk), "--overwrite", "--allowResign"])
     signed = unsigned_apk.with_name(unsigned_apk.stem + "-aligned-debugSigned.apk")
     if not signed.exists():
         signed = unsigned_apk
