@@ -15,10 +15,6 @@ on:
           - mieru
           - naive
           - shadowquic
-      provider_authority_prefix:
-        description: "插件 provider authority 前缀"
-        required: true
-        default: "cn.xuexi.android.plugin"
       vivo_app_id:
         description: "伪装 Vivo App ID（留空：本体默认 2407867，插件默认 284567）"
         required: false
@@ -31,6 +27,10 @@ on:
         description: "覆盖应用名（留空则自动取 Vivo title_zh/title_en）"
         required: false
         default: ""
+      provider_authority_prefix:
+        description: "插件 provider authority 前缀"
+        required: false
+        default: "cn.xuexi.android.plugin"
       allow_compatible_plugin_prefixes:
         description: "是否继续识别 SagerNet/Matsuri/dyhkwong 等兼容插件前缀"
         required: false
@@ -46,23 +46,24 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.26.0"
+          cache: false
 
       - name: Set up Android SDK cmdline tools
         run: |
@@ -122,7 +123,7 @@ jobs:
           echo "tag=v${TS}" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
           name: Source-built husi ${{ github.event.inputs.build_target }} ${{ steps.vars.outputs.tag }}
