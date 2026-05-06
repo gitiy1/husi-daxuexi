@@ -32,6 +32,7 @@ HUSI_REPO = "https://codeberg.org/xchacha20-poly1305/husi"
 DEFAULT_COMPILE_SDK = 37
 DEFAULT_BUILD_TOOLS = "37.0.0"
 DEFAULT_PROVIDER_AUTHORITY_PREFIX = "cn.xuexi.android.plugin"
+ORIGINAL_HUSI_PLUGIN_AUTHORITY_PREFIX = "fr.husi.plugin."
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
 BITMAP_ICON_SUFFIXES = {".png", ".webp", ".jpg", ".jpeg", ".avif"}
 BUILD_TARGETS = ("app", "hysteria2", "juicity", "mieru", "naive", "shadowquic")
@@ -173,6 +174,10 @@ def optional_arg(value: str | None) -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def env_bool(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def validate_package_name(package_name: str):
@@ -581,7 +586,7 @@ def patch_android_sdk_versions(repo_dir: Path, compile_sdk: int, build_tools: st
             path.write_text(new_text, encoding="utf-8")
 
 
-def patch_app_provider_authority_prefix(repo_dir: Path, provider_authority_prefix: str):
+def patch_app_provider_authority_prefix(repo_dir: Path, provider_authority_prefix: str, allow_compatible_plugin_prefixes: bool):
     plugins_file = repo_dir / "composeApp" / "src" / "androidMain" / "kotlin" / "fr" / "husi" / "plugin" / "Plugins.kt"
     if not plugins_file.exists():
         raise RuntimeError(f"未找到 husi 插件识别文件: {plugins_file}")
@@ -593,6 +598,29 @@ def patch_app_provider_authority_prefix(repo_dir: Path, provider_authority_prefi
         text,
         count=1,
     )
+    new_text = new_text.replace(
+        f'const val AUTHORITIES_PREFIX_HUSI_EXE = "{match_prefix}"',
+        (
+            f'const val AUTHORITIES_PREFIX_HUSI_EXE = "{match_prefix}"\n'
+            f'    const val AUTHORITIES_PREFIX_ORIGINAL_HUSI_EXE = "{ORIGINAL_HUSI_PLUGIN_AUTHORITY_PREFIX}"'
+        ),
+        1,
+    )
+    new_text = new_text.replace(
+        "val auth = pkg.providers!![0].authority ?: return false\n"
+        "        for (prefix in allowedSet) {",
+        "val auth = pkg.providers!![0].authority ?: return false\n"
+        "        if (auth.startsWith(AUTHORITIES_PREFIX_ORIGINAL_HUSI_EXE)) return false\n"
+        "        for (prefix in allowedSet) {",
+        1,
+    )
+    if not allow_compatible_plugin_prefixes:
+        for const_name in (
+            "AUTHORITIES_PREFIX_SEKAI_EXE",
+            "AUTHORITIES_PREFIX_NEKO_EXE",
+            "AUTHORITIES_PREFIX_DYHKWONG",
+        ):
+            new_text = re.sub(rf"\n\s*add\({const_name}\)", "", new_text, count=1)
     if new_text == text:
         raise RuntimeError("未能替换 AUTHORITIES_PREFIX_HUSI_EXE")
     plugins_file.write_text(new_text, encoding="utf-8")
@@ -744,6 +772,12 @@ def main():
         action="store_true",
         help="图标替换失败时继续构建；默认失败退出，避免发布旧图标",
     )
+    p.add_argument(
+        "--allow-compatible-plugin-prefixes",
+        action="store_true",
+        default=env_bool("ALLOW_COMPATIBLE_PLUGIN_PREFIXES"),
+        help="继续兼容 SagerNet/Matsuri/dyhkwong 等旧插件前缀；默认关闭以避免检测到原官方插件",
+    )
     args = p.parse_args()
     args.package_name = optional_arg(args.package_name)
     args.app_name = optional_arg(args.app_name)
@@ -770,7 +804,7 @@ def main():
         old_pkg, old_vc, _ = read_husi_properties(props)
         new_vc = compute_version_code(old_vc, args.version_offset, args.min_version_code, brand.version_code)
         write_husi_properties(props, brand.package_name, new_vc, brand.version_name)
-        patch_app_provider_authority_prefix(repo, args.provider_authority_prefix)
+        patch_app_provider_authority_prefix(repo, args.provider_authority_prefix, args.allow_compatible_plugin_prefixes)
 
         # 使用官方 rename 流程（README 提供）
         run(["./run", "rename", brand.package_name], cwd=repo)
