@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
@@ -26,6 +27,35 @@ VIVO_USER_AGENT = (
 )
 DEFAULT_VIVO_APP_ID = "2407867"
 HUSI_REPO = "https://codeberg.org/xchacha20-poly1305/husi"
+ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
+BITMAP_ICON_SUFFIXES = {".png", ".webp", ".jpg", ".jpeg", ".avif"}
+LAUNCHER_ICON_SIZES = {
+    "mipmap-mdpi": 48,
+    "mipmap-hdpi": 72,
+    "mipmap-xhdpi": 96,
+    "mipmap-xxhdpi": 144,
+    "mipmap-xxxhdpi": 192,
+}
+DENSITY_RANK = {
+    "ldpi": 1,
+    "mdpi": 2,
+    "hdpi": 3,
+    "xhdpi": 4,
+    "xxhdpi": 5,
+    "xxxhdpi": 6,
+    "nodpi": 7,
+}
+VIVO_ICON_URL_KEYS = (
+    "icon",
+    "icon_url",
+    "iconUrl",
+    "logo",
+    "logo_url",
+    "logoUrl",
+    "app_icon",
+    "appIcon",
+)
+VIVO_DOWNLOAD_URL_KEYS = ("download_url", "downloadUrl", "apk_url", "apkUrl", "download")
 
 
 def run(cmd, cwd=None, env=None):
@@ -47,6 +77,80 @@ def download_file(url: str, out_path: Path):
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=600) as resp, open(out_path, "wb") as f:
         shutil.copyfileobj(resp, f)
+
+
+def get_first_url(data: dict, keys) -> str | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            return value
+        if isinstance(value, dict):
+            for nested_key in ("url", "download_url", "downloadUrl"):
+                nested_value = value.get(nested_key)
+                if isinstance(nested_value, str) and nested_value.startswith(("http://", "https://")):
+                    return nested_value
+    return None
+
+
+def find_imagemagick() -> str:
+    tool = shutil.which("magick") or shutil.which("convert")
+    if not tool:
+        raise RuntimeError("未找到 ImageMagick（magick/convert），无法生成 Android 启动图标")
+    return tool
+
+
+def image_dimensions(path: Path) -> tuple[int, int]:
+    if not path.is_file():
+        return 0, 0
+    magick = shutil.which("magick")
+    identify = shutil.which("identify")
+    if magick:
+        cmd = [magick, "identify", "-format", "%w %h", str(path)]
+    elif identify:
+        cmd = [identify, "-format", "%w %h", str(path)]
+    else:
+        return 0, 0
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
+        width, height = out.split()
+        return int(width), int(height)
+    except Exception:
+        return 0, 0
+
+
+def density_rank(path: Path) -> int:
+    parent = path.parent.name.lower()
+    for density, rank in sorted(DENSITY_RANK.items(), key=lambda item: len(item[0]), reverse=True):
+        if density in parent:
+            return rank
+    return 0
+
+
+def bitmap_score(path: Path) -> tuple[int, int, int]:
+    width, height = image_dimensions(path)
+    return width * height, density_rank(path), path.stat().st_size
+
+
+def convert_icon_to_png(source: Path, target: Path, size: int):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tool = find_imagemagick()
+    run(
+        [
+            tool,
+            str(source),
+            "-auto-orient",
+            "-resize",
+            f"{size}x{size}",
+            "-background",
+            "none",
+            "-gravity",
+            "center",
+            "-extent",
+            f"{size}x{size}",
+            "-strip",
+            f"PNG32:{target}",
+        ]
+    )
 
 
 def clone_husi_source(workdir: Path) -> Path:
@@ -98,27 +202,155 @@ def fetch_vivo_info(app_id: str):
     return data
 
 
+def parse_resource_ref(ref: str) -> tuple[str, str] | None:
+    if not ref or not ref.startswith("@") or ref.startswith("@android:"):
+        return None
+    value = ref[1:]
+    if ":" in value:
+        value = value.split(":", 1)[1]
+    if "/" not in value:
+        return None
+    res_type, name = value.split("/", 1)
+    if not res_type or not name:
+        return None
+    return res_type, name
+
+
+def resource_candidates(decoded_dir: Path, ref: str) -> list[Path]:
+    parsed = parse_resource_ref(ref)
+    if not parsed:
+        return []
+    res_type, name = parsed
+    return list((decoded_dir / "res").glob(f"{res_type}*/{name}.*"))
+
+
+def best_bitmap(candidates: list[Path]) -> Path | None:
+    bitmaps = [p for p in candidates if p.suffix.lower() in BITMAP_ICON_SUFFIXES and p.is_file()]
+    if not bitmaps:
+        return None
+    return max(bitmaps, key=bitmap_score)
+
+
+def referenced_drawables(xml_path: Path) -> list[str]:
+    refs = []
+    try:
+        root = ET.parse(xml_path).getroot()
+    except ET.ParseError:
+        return refs
+    for elem in root.iter():
+        for attr in (f"{ANDROID_NS}drawable", f"{ANDROID_NS}src"):
+            value = elem.attrib.get(attr)
+            if value and value.startswith("@"):
+                refs.append(value)
+    return refs
+
+
+def resolve_bitmap_resource(decoded_dir: Path, ref: str, seen: set[str] | None = None) -> Path | None:
+    seen = seen or set()
+    if ref in seen:
+        return None
+    seen.add(ref)
+
+    candidates = resource_candidates(decoded_dir, ref)
+    direct = best_bitmap(candidates)
+    if direct:
+        return direct
+
+    for xml_path in sorted((p for p in candidates if p.suffix.lower() == ".xml"), key=density_rank, reverse=True):
+        for child_ref in referenced_drawables(xml_path):
+            resolved = resolve_bitmap_resource(decoded_dir, child_ref, seen)
+            if resolved:
+                return resolved
+    return None
+
+
+def extract_apk_launcher_icon(decoded_dir: Path) -> Path:
+    manifest = (decoded_dir / "AndroidManifest.xml").read_text(encoding="utf-8")
+    icon_ref = re.search(r'android:icon="([^"]+)"', manifest)
+    if icon_ref:
+        resolved = resolve_bitmap_resource(decoded_dir, icon_ref.group(1))
+        if resolved:
+            return resolved
+
+    fallback = best_bitmap(
+        list((decoded_dir / "res").glob("mipmap*/ic_launcher.*"))
+        + list((decoded_dir / "res").glob("drawable*/ic_launcher.*"))
+    )
+    if fallback:
+        return fallback
+    raise RuntimeError("未能从学习强国 APK 中解析出可用的启动图标位图")
+
+
+def download_vivo_store_icon(info: dict, workdir: Path) -> Path | None:
+    icon_url = get_first_url(info, VIVO_ICON_URL_KEYS)
+    if not icon_url:
+        return None
+    icon_path = workdir / "xuexi-store-icon"
+    suffix = Path(icon_url.split("?", 1)[0]).suffix
+    if suffix.lower() in BITMAP_ICON_SUFFIXES:
+        icon_path = icon_path.with_suffix(suffix)
+    else:
+        icon_path = icon_path.with_suffix(".png")
+    download_file(icon_url, icon_path)
+    if image_dimensions(icon_path) == (0, 0):
+        return None
+    return icon_path
+
+
+def clear_existing_launcher_icons(res_dir: Path):
+    for target in res_dir.glob("mipmap*/ic_launcher*.*"):
+        target.unlink()
+
+
+def install_launcher_icons(repo_dir: Path, source_icon: Path) -> list[Path]:
+    res_dir = repo_dir / "composeApp" / "src" / "androidMain" / "res"
+    clear_existing_launcher_icons(res_dir)
+
+    generated = []
+    for dirname, size in LAUNCHER_ICON_SIZES.items():
+        icon = res_dir / dirname / "ic_launcher.png"
+        round_icon = res_dir / dirname / "ic_launcher_round.png"
+        convert_icon_to_png(source_icon, icon, size)
+        convert_icon_to_png(source_icon, round_icon, size)
+        generated.extend([icon, round_icon])
+
+    playstore_icon = repo_dir / "composeApp" / "src" / "androidMain" / "ic_launcher-playstore.png"
+    convert_icon_to_png(source_icon, playstore_icon, 512)
+    generated.append(playstore_icon)
+    return generated
+
+
 def replace_icons(repo_dir: Path, workdir: Path, vivo_app_id: str):
     info = fetch_vivo_info(vivo_app_id)
-    vivo_apk = workdir / f"xuexi-{info['version_code']}.apk"
-    download_file(info["download_url"], vivo_apk)
-    decoded = workdir / "decoded-vivo"
-    run(["apktool", "d", "-f", str(vivo_apk), "-o", str(decoded)])
+    version_code = info.get("version_code") or info.get("versionCode") or "latest"
+    icon_sources = []
 
-    manifest = (decoded / "AndroidManifest.xml").read_text(encoding="utf-8")
-    icon_ref = re.search(r'android:icon="([^"]+)"', manifest)
-    if not icon_ref:
-        return
-    icon_type, icon_name = icon_ref.group(1).removeprefix("@").split("/", 1)
-    src_icons = list((decoded / "res").glob(f"{icon_type}*/{icon_name}.*"))
-    if not src_icons:
-        return
+    try:
+        store_icon = download_vivo_store_icon(info, workdir)
+        if store_icon:
+            icon_sources.append(store_icon)
+    except Exception as e:
+        print(f"WARN: Vivo 图标资源下载失败，将尝试从 APK 提取: {e}")
 
-    for target in (repo_dir / "composeApp" / "src" / "androidMain" / "res").glob("mipmap*/ic_launcher*"):
-        same_suffix = [s for s in src_icons if s.suffix == target.suffix]
-        if not same_suffix:
-            continue
-        shutil.copy2(same_suffix[0], target)
+    download_url = get_first_url(info, VIVO_DOWNLOAD_URL_KEYS)
+    if download_url:
+        try:
+            vivo_apk = workdir / f"xuexi-{version_code}.apk"
+            download_file(download_url, vivo_apk)
+            decoded = workdir / "decoded-vivo"
+            run(["apktool", "d", "-f", str(vivo_apk), "-o", str(decoded)])
+            icon_sources.append(extract_apk_launcher_icon(decoded))
+        except Exception as e:
+            if not icon_sources:
+                raise RuntimeError(f"从学习强国 APK 提取图标失败: {e}") from e
+            print(f"WARN: 从学习强国 APK 提取图标失败，将使用 Vivo 图标资源: {e}")
+    elif not icon_sources:
+        raise RuntimeError(f"Vivo API 未返回 APK 下载地址或图标资源: {info}")
+
+    source_icon = max(icon_sources, key=bitmap_score)
+
+    generated = install_launcher_icons(repo_dir, source_icon)
+    print(f"INFO: 已用 {source_icon} 生成 {len(generated)} 个学习强国启动图标资源")
 
 
 def ensure_android_local_properties(repo_dir: Path):
@@ -186,6 +418,11 @@ def main():
     p.add_argument("--vivo-app-id", default=os.environ.get("VIVO_APP_ID", DEFAULT_VIVO_APP_ID))
     p.add_argument("--version-offset", type=int, default=10000)
     p.add_argument("--min-version-code", type=int, default=10001)
+    p.add_argument(
+        "--allow-icon-fallback",
+        action="store_true",
+        help="图标替换失败时继续构建；默认失败退出，避免发布旧 husi 图标",
+    )
     args = p.parse_args()
 
     workdir = Path(args.workdir)
@@ -205,7 +442,10 @@ def main():
     try:
         replace_icons(repo, workdir, args.vivo_app_id)
     except Exception as e:
-        print(f"WARN: 图标替换失败: {e}")
+        if args.allow_icon_fallback:
+            print(f"WARN: 图标替换失败，将继续构建: {e}")
+        else:
+            raise RuntimeError(f"图标替换失败，已停止构建以避免发布旧 husi 图标: {e}") from e
 
     ensure_android_local_properties(repo)
     unsigned = build_apk_official_flow(repo)
